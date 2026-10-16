@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# pi plugins baked into the image (installed as /usr/local/bin/zpa-pi).
+#
+#   zpa-pi bake <conf> <dest>   build time: `pi install` every spec in <conf>
+#                               into <dest>, write <dest>/plugins.list
+#   pi [args...]                (via the /usr/local/bin/pi symlink) run pi with
+#                               `-e <dir>` for every baked plugin
+#
+# A baked plugin is skipped when the user installed the same package
+# themselves (`pi install`, global or -l project scope), so theirs wins.
+# plugins.list lines: "<id>|<dir>", id = npm:<name> or git:<host>/<path>.
+set -euo pipefail
+
+PI_REAL=/usr/local/bin/pi-real
+BAKED=/opt/zpa/pi-plugins
+
+# Normalize a pi package source to pi's identity: npm name, or git repo
+# without scheme, user, .git and @ref.
+plugin_id() {
+  local s="$1" host
+  case "$s" in
+    npm:@*) s="${s#npm:@}"; printf 'npm:@%s\n' "${s%%@*}" ;;
+    npm:*)  s="${s#npm:}"; printf 'npm:%s\n' "${s%%@*}" ;;
+    git:*|http://*|https://*|ssh://*|git@*)
+      if [[ "$s" =~ ^git@[^/]*: ]]; then      # git@host:owner/repo
+        s="${s#git@}"; s="${s/:/\/}"
+      fi
+      s="${s#git:}"; s="${s#*://}"
+      host="${s%%/*}"
+      host="${host#*@}"; host="${host%%:*}"   # drop user@ and :port
+      s="$host/${s#*/}"
+      s="${s%%@*}"; s="${s%.git}"            # drop @ref and .git
+      printf 'git:%s\n' "$s" ;;
+    *) return 1 ;;
+  esac
+}
+
+# pi-plugins.conf line -> pi install spec ("" for blank/comment lines)
+conf_spec() {
+  local spec
+  spec="$(sed 's/#.*//' <<<"$1" | xargs)"
+  case "$spec" in
+    "") ;;
+    github:*) spec="git:github.com/${spec#github:}" ;;
+    npm:*|git:*|http://*|https://*|ssh://*) ;;
+    *) spec="npm:$spec" ;;
+  esac
+  printf '%s\n' "$spec"
+}
+
+bake() {
+  local conf="$1" dest="$2" line spec id dir before after
+  local agent="$dest/home/.pi/agent"
+  mkdir -p "$agent"
+  : > "$dest/plugins.list"
+  [[ -f "$conf" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    spec="$(conf_spec "$line")"
+    [[ -n "$spec" ]] || continue
+    id="$(plugin_id "$spec")" || { echo "zpa-pi: unsupported plugin spec: $spec" >&2; exit 1; }
+    before="$(find "$agent" -path '*/git/*' -name .git -prune 2>/dev/null | sort)"
+    echo "== pi install $spec" >&2
+    HOME="$dest/home" PI_CODING_AGENT_DIR="$agent" "$PI_REAL" install "$spec" >&2
+    if [[ "$id" == npm:* ]]; then
+      dir="$agent/npm/node_modules/${id#npm:}"
+    else
+      after="$(find "$agent" -path '*/git/*' -name .git -prune | sort)"
+      dir="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1)"
+      dir="${dir%/.git}"
+    fi
+    [[ -n "$dir" && -f "$dir/package.json" ]] || { echo "zpa-pi: $spec installed, but no package found" >&2; exit 1; }
+    printf '%s|%s\n' "$id" "$dir" >> "$dest/plugins.list"
+  done < "$conf"
+  rm -rf "$dest/home/.npm"
+  chmod -R a+rX "$dest"
+  echo "== baked pi plugins:" >&2
+  cat "$dest/plugins.list" >&2
+}
+
+# ids of packages the user installed (global agent dir + project .pi/)
+user_plugin_ids() {
+  local f s
+  for f in "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/settings.json" "$PWD/.pi/settings.json"; do
+    [[ -f "$f" ]] || continue
+    jq -r '.packages[]? | if type == "string" then . else .source // empty end' "$f" 2>/dev/null |
+      while IFS= read -r s; do plugin_id "$s" || true; done
+  done
+}
+
+run_pi() {
+  local args=() id dir mine
+  # package/auth/mcp subcommands manage settings: don't load plugins for them
+  case "${1:-}" in
+    install|remove|uninstall|update|list|config|auth|mcp|-h|--help|-v|--version)
+      exec "$PI_REAL" "$@" ;;
+  esac
+  if [[ -s "$BAKED/plugins.list" ]]; then
+    mine="$(user_plugin_ids)"
+    while IFS='|' read -r id dir; do
+      grep -qxF "$id" <<<"$mine" && continue
+      args+=(-e "$dir")
+    done < "$BAKED/plugins.list"
+  fi
+  exec "$PI_REAL" "${args[@]}" "$@"
+}
+
+case "$(basename "$0")" in
+  pi) run_pi "$@" ;;
+esac
+case "${1:-}" in
+  bake) bake "$2" "$3" ;;
+  *)    sed -n '2,/^set -e/{/^#/s/^# \{0,1\}//p}' "$0"; exit 2 ;;
+esac

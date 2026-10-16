@@ -1,0 +1,27 @@
+{
+  "nano-gpt": {
+    "models": [
+      {
+        "type": "chat",
+        "id": "auto-model",
+        "name": "Auto model",
+        "reasoning": false,
+        "input": [
+          "text"
+        ],
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 1000000,
+        "maxTokens": 1000000,
+        "provider": "nano-gpt",
+        "api": "openai-completions",
+        "baseUrl": "https://api.nano-gpt.com/api/v1"
+      }
+    ],
+    "checkedAt": 1
+  }
+}

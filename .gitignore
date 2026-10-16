@@ -1,0 +1,12 @@
+# Claude Code / agent state when the repo itself is opened as a project
+.claude/
+.claude.json
+.podman/
+# stray HOME files from running tools with HOME=<repo>
+.cache/
+.config/
+.local/
+.npm/
+# local build inputs
+pi-plugins.local.conf
+agents.local.conf

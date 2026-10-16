@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# In-container helper (baked into the image as /usr/local/bin/zpa-exec).
+#
+#   zpa-exec run <id> <cmd...>   record pid under <id>, then exec cmd
+#   zpa-exec kill <id>           TERM (then KILL) the recorded process tree
+#   zpa-exec agent <kind>        exec the kind's ACP command (agents.conf) on stdio
+#   zpa-exec agents              list the kinds in agents.conf
+#   zpa-exec setup               seed the (empty) home on container creation
+#
+# `podman exec` does not kill the exec'd process when its client dies, so the
+# host side (zpa) runs every agent/shell via `run` and calls `kill` once the
+# process Zed spawned is gone.
+set -euo pipefail
+
+RUN_DIR=/tmp/zpa-sessions
+AGENTS_CONF=/opt/zpa/agents.conf
+
+# Print the ACP command of kind $1 from agents.conf (exit 1 if unknown).
+agent_cmd() {
+  awk -F'|' -v k="$1" '
+    /^[[:space:]]*(#|$)/ { next }
+    { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $3) }
+    $1 == k { print $3; found = 1; exit }
+    END { exit !found }' "$AGENTS_CONF"
+}
+
+# Process start time (field 22 of /proc/<pid>/stat), to detect pid reuse.
+starttime() {
+  local s fields
+  s="$(<"/proc/$1/stat")" || return 1
+  read -ra fields <<<"${s##*) }"   # skip "pid (comm) ", comm may contain spaces
+  printf '%s\n' "${fields[19]}"
+}
+
+descendants() {
+  local c
+  for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+    descendants "$c"
+    printf '%s\n' "$c"
+  done
+}
+
+case "${1:-}" in
+  run)
+    id="$2"; shift 2
+    mkdir -p "$RUN_DIR"
+    printf '%s %s\n' "$$" "$(starttime $$)" > "$RUN_DIR/$id"
+    exec "$@"
+    ;;
+
+  kill)
+    f="$RUN_DIR/$2"
+    [[ -f "$f" ]] || exit 0
+    read -r pid start < "$f"
+    rm -f "$f"
+    [[ "$(starttime "$pid" 2>/dev/null)" == "$start" ]] || exit 0
+    # collect the tree first: children get reparented once the leader dies
+    mapfile -t pids < <(descendants "$pid")
+    pids+=("$pid")
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    for _ in {1..10}; do
+      alive=()
+      for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive+=("$p"); done
+      ((${#alive[@]})) || exit 0
+      sleep 0.5
+    done
+    kill -KILL "${alive[@]}" 2>/dev/null || true
+    ;;
+
+  agent)
+    cmd="$(agent_cmd "${2:-}")" || {
+      echo "zpa-exec: unknown agent '${2:-}'; this image has: $("$0" agents | paste -sd' ')" >&2
+      exit 2
+    }
+    # nano-gpt: fetch the model list for the project's key (docs/nano-gpt.md)
+    if [[ "$2" == pi && -f /opt/zpa/nano-catalog.py ]]; then
+      python3 /opt/zpa/nano-catalog.py >&2 || true
+    fi
+    read -ra argv <<<"$cmd"
+    while [[ "${argv[0]:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+      export "${argv[0]}"; argv=("${argv[@]:1}")
+    done
+    exec "${argv[@]}"
+    ;;
+
+  agents)
+    awk -F'|' '/^[[:space:]]*(#|$)/ { next } { gsub(/[ \t]/, "", $1); print $1 }' "$AGENTS_CONF"
+    ;;
+
+  setup)
+    # $HOME is an empty bind mount on first start: seed shell dotfiles
+    for f in /etc/skel/.bashrc /etc/skel/.profile /etc/skel/.bash_logout; do
+      if [[ -e "$f" && ! -e "$HOME/${f##*/}" ]]; then cp "$f" "$HOME/"; fi
+    done
+    # nano-gpt: one-model stub catalog until nano-catalog.py fetches the real one
+    seed=/opt/zpa/nano-gpt-models.seed.json
+    store="$HOME/.pi/agent/models-store.json"
+    if [[ -f "$seed" ]] && [[ ! -s "$store" || "$(cat "$store" 2>/dev/null)" == "{}" ]]; then
+      mkdir -p "$HOME/.pi/agent"
+      cp "$seed" "$store"
+    fi
+    ;;
+
+  *)
+    echo "usage: zpa-exec run <id> <cmd...> | kill <id> | agent <kind> | agents | setup" >&2
+    exit 2
+    ;;
+esac

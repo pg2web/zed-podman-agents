@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# zpa — Zed Podman Agents (host side).
+#
+# One rootless podman container per project runs the ACP agents (agents.conf)
+# and the project's Zed terminals. The project is mounted at its own host path
+# (so ACP paths match Zed's); <project>/.podman/home is the container's HOME.
+#
+#   zpa acp <kind>         Zed agent_servers entry point (ACP on stdio)
+#   zpa shell [args...]    Zed terminal.shell entry point (also as `zpa-shell`)
+#   zpa init [dir]         opt a project in and start its container
+#   zpa status [dir]       show the project's container
+#   zpa ls                 list all zpa containers
+#   zpa stop [dir]         stop the container (state is kept)
+#   zpa rm [--state] [dir] remove the container (--state: also <dir>/.podman)
+#   zpa upgrade [dir]      recreate containers whose image or network setup is outdated
+set -euo pipefail
+
+ZPA_IMAGE="${ZPA_IMAGE:-localhost/zed-agents:latest}"
+STATE=.podman            # per-project dir: container (marker), home/, lock
+CT_HOME=/home/node
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/zpa"   # written by install.sh
+# pasta forwards ports opened in the container to the host's loopback
+NET_SPEC='pasta:-t,127.0.0.1/auto,-u,127.0.0.1/auto'
+
+# Host-session variables never forwarded into the container. Everything else
+# in the environment (e.g. keys set in Zed's agent `env`) is forwarded.
+# Extend with ZPA_ENV_DENY='REGEX'; force-forward with ZPA_ENV_ALLOW='REGEX'.
+ENV_DENY='PATH|HOME|USER|LOGNAME|SHELL|PWD|OLDPWD|SHLVL|_|HOSTNAME|HOST|MAIL'
+ENV_DENY+='|TERM|TERM_PROGRAM.*|COLORTERM|LANG|LANGUAGE|LC_.*|TZ|TMPDIR|TMP|TEMP'
+ENV_DENY+='|EDITOR|VISUAL|PAGER|LESS.*|LS_COLORS|HIST.*|PS[0-9]|PROMPT_COMMAND|MOTD_SHOWN|which_declare'
+ENV_DENY+='|DISPLAY|XAUTHORITY|WINDOWID|SSH_.*|GPG_.*|XDG_.*|DBUS_.*|WAYLAND_.*'
+ENV_DENY+='|GTK_.*|GDK_.*|QT_.*|GIO_.*|GJS_.*|GNOME_.*|KDE_.*|DESKTOP_.*|SESSION_.*|GDM.*|MOZ_.*'
+ENV_DENY+='|INVOCATION_ID|JOURNAL_STREAM|MANAGERPID|SYSTEMD_.*|NOTIFY_SOCKET|DEBUGINFOD_.*'
+ENV_DENY+='|ZED_.*|ZPA_.*|VTE_.*|KONSOLE_.*|KITTY_.*|ALACRITTY_.*|TMUX.*|STY'
+ENV_DENY+='|NODE_OPTIONS|NODE_PATH|NVM_.*|npm_.*|container|CONTAINER_.*|CONTAINERS_.*|PODMAN_.*'
+
+log() { printf 'zpa: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+# Compare two podman image IDs that may differ in form: `podman ps` gives a
+# short 12-hex ImageID while `image inspect` may give a full hex with or
+# without a `sha256:` prefix. True when one is a prefix of the other.
+image_id_eq() {
+  local a="${1#sha256:}" b="${2#sha256:}"
+  [[ -n "$a" && -n "$b" ]] && { [[ "$a" == "$b"* || "$b" == "$a"* ]]; }
+}
+
+# Nearest ancestor of $1 (inclusive) that has .podman/container.
+find_project() {
+  local d
+  d="$(realpath -m "${1:-$PWD}")"
+  while :; do
+    [[ -f "$d/$STATE/container" ]] && { printf '%s\n' "$d"; return 0; }
+    [[ "$d" == / ]] && return 1
+    d="$(dirname "$d")"
+  done
+}
+
+# Project dir given as argument, else the one containing $PWD.
+project_arg() {
+  if [[ -n "${1:-}" ]]; then
+    find_project "$1" || die "$1 is not a zpa project (run: zpa init $1)"
+  else
+    find_project "$PWD" || die "$PWD is not inside a zpa project (run: zpa init)"
+  fi
+}
+
+slug() {
+  basename "$1" | tr -cs 'A-Za-z0-9-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-32
+}
+
+name_for() {
+  local s
+  s="$(slug "$1")"
+  printf 'zpa-%s-%s\n' "${s:-root}" "$(printf '%s' "$1" | sha256sum | cut -c1-8)"
+}
+
+# Create .podman/ (marker, home, .gitignore) if missing.
+init_state() {
+  local p="$1" home
+  home="$(realpath -m "$HOME")"
+  if [[ -z "${ZPA_FORCE:-}" ]] && [[ "$p" == / || "$p" == "$home" || "$home" == "$p"/* ]]; then
+    die "refusing to use $p as a project (open a project folder, or set ZPA_FORCE=1)"
+  fi
+  mkdir -p "$p/$STATE/home"
+  chmod 700 "$p/$STATE"
+  [[ -f "$p/$STATE/.gitignore" ]] || printf '*\n' > "$p/$STATE/.gitignore"
+  [[ -s "$p/$STATE/container" ]] || name_for "$p" > "$p/$STATE/container"
+}
+
+# When /home is a symlink (Silverblue: /home -> /var/home), print the /home/...
+# path of project $1. Zed uses that form, so it is mounted as well.
+home_alias() {
+  local target
+  [[ -L /home ]] || return 0
+  target="$(readlink -f /home)" || return 0
+  [[ "$1" == "$target"/* ]] && printf '/home/%s\n' "${1#"$target"/}"
+  return 0
+}
+
+# device:inode of the project and its .podman/home. A bind mount keeps pointing
+# at the directory it was made from, so if either is replaced while the
+# container runs, the container must be recreated.
+mount_ids() {
+  stat -c '%d:%i' "$1" "$1/$STATE/home" 2>/dev/null | paste -sd,
+}
+
+# Set the caller's status, mounts and owner (the zpa.project label) for
+# container $1; all empty when it doesn't exist.
+read_container() {
+  status="" mounts="" owner=""
+  IFS='|' read -r status mounts owner < <(podman container inspect -f \
+    '{{.State.Status}}|{{index .Config.Labels "zpa.mounts"}}|{{index .Config.Labels "zpa.project"}}' \
+    "$1" 2>/dev/null) || true
+}
+
+create() {
+  local p="$1" name="$2" host alias alias_mount=()
+  podman image exists "$ZPA_IMAGE" || die "image $ZPA_IMAGE not found (run install.sh)"
+  log "creating container $name for $p"
+  host="${name#zpa-}"
+  alias="$(home_alias "$p")"
+  [[ -n "$alias" && "$alias" != "$p" ]] && alias_mount=(-v "$alias:$alias:rslave")
+  # {lock}>&-: podman forks a conmon that lives as long as the container; if it
+  # inherited the caller's lock fd, every later zpa call would block on flock.
+  podman run -d --name "$name" --hostname "${host%-*}" \
+    --init --restart=always --network "$NET_SPEC" \
+    --userns=keep-id:uid=1000,gid=1000 --security-opt label=disable \
+    -v "$p:$p:rslave" "${alias_mount[@]}" -v "$p/$STATE/home:$CT_HOME" \
+    -e HOME="$CT_HOME" -w "$p" \
+    --label zpa.project="$p" --label zpa.mounts="$(mount_ids "$p")" \
+    --label zpa.net="$NET_SPEC" \
+    "$ZPA_IMAGE" sleep infinity >/dev/null {lock}>&-
+  podman exec "$name" zpa-exec setup >&2 {lock}>&- || log "warning: in-container setup failed"
+}
+
+# Make sure the project's container exists and runs; print its name.
+# Locked per project so parallel Zed threads don't race on `podman run`.
+ensure() {
+  local p="$1" s="$1/$STATE" name lock status mounts owner
+  init_state "$p"
+  exec {lock}>"$s/lock"
+  flock "$lock"
+  name="$(<"$s/container")"
+  read_container "$name"
+  if [[ -n "$status" && "$owner" != "$p" ]]; then
+    # .podman/ was copied here from another project: don't share its container
+    log "container $name belongs to $owner, not $p; using a new one"
+    name="$(name_for "$p")"
+    printf '%s\n' "$name" > "$s/container"
+    read_container "$name"
+    [[ -z "$status" || "$owner" == "$p" ]] || die "container name $name is taken"
+  fi
+  if [[ -n "$mounts" && "$mounts" != "$(mount_ids "$p")" ]]; then
+    log "$p or its $STATE/ was replaced while $name was running; recreating the container"
+    podman rm -f "$name" >/dev/null
+    status=""
+  fi
+  if [[ -z "$status" ]]; then
+    create "$p" "$name"
+  elif [[ "$status" != running ]]; then
+    podman start "$name" >/dev/null {lock}>&-   # conmon again, see create
+  fi
+  exec {lock}>&-
+  printf '%s\n' "$name"
+}
+
+# Fill the array named $1 with `-e NAME` flags (values are read by podman from
+# its own environment, so secrets don't appear in `ps`).
+env_flags() {
+  local -n _out="$1"
+  local k
+  _out=()
+  while IFS= read -r k; do
+    if [[ -n "${ZPA_ENV_ALLOW:-}" && "$k" =~ ^(${ZPA_ENV_ALLOW})$ ]]; then
+      _out+=(-e "$k")
+      continue
+    fi
+    [[ "$k" =~ ^(${ENV_DENY})$ ]] && continue
+    [[ -n "${ZPA_ENV_DENY:-}" && "$k" =~ ^(${ZPA_ENV_DENY})$ ]] && continue
+    _out+=(-e "$k")
+  done < <(compgen -e)
+}
+
+# Export the `env` of every zpa agent in Zed's settings, so keys set for any
+# agent also reach the terminals. Variables already set here win.
+export_agent_env() {
+  local settings="${ZED_SETTINGS:-${XDG_CONFIG_HOME:-$HOME/.config}/zed/settings.json}"
+  local kv name
+  [[ -f "$DATA/zed-settings.py" && -f "$settings" ]] || return 0
+  while IFS= read -r -d '' kv; do
+    name="${kv%%=*}"
+    if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && ! -v "$name" ]]; then export "$name=${kv#*=}"; fi
+  done < <(python3 -I "$DATA/zed-settings.py" env "$settings" "$DATA" 2>/dev/null ||
+           log "could not read agent env from $settings")
+}
+
+# Kill session $2 in container $1 once this process (which execs podman) dies.
+# Detached into its own session so it survives Zed killing us.
+watch_session() {
+  setsid -f bash -c '
+    while kill -0 "$1" 2>/dev/null; do sleep 2; done
+    podman exec "$2" zpa-exec kill "$3"
+  ' zpa-watch "$$" "$1" "$2" </dev/null >/dev/null 2>&1
+}
+
+host_shell() {
+  local sh="${SHELL:-}"
+  if [[ -z "$sh" || "$(basename "$sh")" == zpa* ]]; then
+    sh="$(getent passwd "$(id -u)" | cut -d: -f7)"
+  fi
+  [[ -x "$sh" ]] || sh=/bin/bash
+  if (($#)); then exec "$sh" "$@"; else exec "$sh" -l; fi
+}
+
+cmd_acp() {
+  local kind="${1:-}" p name id envf
+  [[ "$kind" =~ ^[a-z0-9-]+$ ]] || die "usage: zpa acp <kind>"
+  # check before the folder gets opted in
+  if [[ -f "$DATA/agents.conf" ]] && ! grep -Eq "^[[:space:]]*${kind}[[:space:]]*\|" "$DATA/agents.conf"; then
+    die "unknown agent '$kind' (not in $DATA/agents.conf; see docs/adding-agents.md)"
+  fi
+  # Zed starts agents in the worktree root; the first thread opts the folder in
+  p="$(find_project "$PWD")" || p="$(realpath -m "$PWD")"
+  name="$(ensure "$p")"
+  env_flags envf
+  id="acp-$kind-$$-$RANDOM"
+  watch_session "$name" "$id"
+  exec podman exec -i -w "$p" "${envf[@]}" "$name" \
+    zpa-exec run "$id" zpa-exec agent "$kind"
+}
+
+cmd_shell() {
+  local p name id dir envf tty=() cmd=(bash -l)
+  p="$(find_project "$PWD")" || host_shell "$@"
+  if ! name="$(ensure "$p")"; then
+    # never fall back to the host: this may be an agent-issued command
+    log "container for $p is unavailable"
+    if [[ -t 0 ]] && ! (($#)); then read -r -p "press Enter to close " _ || true; fi
+    exit 1
+  fi
+  dir="$(realpath -m "$PWD")"
+  [[ "$dir" == "$p" || "$dir" == "$p"/* ]] || dir="$p"
+  [[ -t 0 && -t 1 ]] && tty=(-t)
+  export TERM="${TERM:-xterm-256color}"
+  export_agent_env
+  env_flags envf
+  envf+=(-e TERM)
+  [[ -n "${COLORTERM:-}" ]] && envf+=(-e COLORTERM)
+  (($#)) && cmd=(bash "$@")
+  id="sh-$$-$RANDOM"
+  watch_session "$name" "$id"
+  exec podman exec -i "${tty[@]}" -w "$dir" "${envf[@]}" "$name" zpa-exec run "$id" "${cmd[@]}"
+}
+
+cmd_init() {
+  local p name
+  p="$(realpath -m "${1:-$PWD}")"
+  [[ -d "$p" ]] || die "$p is not a directory"
+  name="$(ensure "$p")"
+  echo "$p -> $name"
+}
+
+cmd_status() {
+  local p name
+  p="$(project_arg "${1:-}")"
+  name="$(<"$p/$STATE/container")"
+  echo "project:   $p"
+  echo "container: $name"
+  if podman container exists "$name"; then
+    local status img cur net
+    IFS='|' read -r status img net < <(podman container inspect \
+      -f '{{.State.Status}}|{{.Image}}|{{index .Config.Labels "zpa.net"}}' "$name")
+    cur="$(podman image inspect -f '{{.Id}}' "$ZPA_IMAGE" 2>/dev/null)" || cur=""
+    echo "status:    $status"
+    if [[ -z "$cur" ]]; then echo "image:     ? ($ZPA_IMAGE not built)"
+    elif image_id_eq "$img" "$cur"; then echo "image:     current"
+    else echo "image:     outdated (zpa upgrade)"; fi
+    if [[ "$net" == "$NET_SPEC" ]]; then echo "ports:     listening ports are forwarded to 127.0.0.1"
+    else echo "ports:     not forwarded (run zpa upgrade)"; fi
+    if [[ "$status" == running ]]; then
+      echo "sessions:  $(podman exec "$name" sh -c 'ls /tmp/zpa-sessions 2>/dev/null | tr "\n" " "')"
+    fi
+  else
+    echo "status:    not created (starts on first use)"
+  fi
+}
+
+cmd_ls() {
+  # no `table`: podman cannot derive a header from the index expression
+  podman ps -a --filter label=zpa.project \
+    --format '{{.Names}}\t{{.Status}}\t{{index .Labels "zpa.project"}}' |
+    column -t -s $'\t' -N CONTAINER,STATUS,PROJECT
+}
+
+cmd_stop() {
+  local p
+  p="$(project_arg "${1:-}")"
+  podman stop -t 5 "$(<"$p/$STATE/container")" >/dev/null
+  echo "stopped"
+}
+
+cmd_rm() {
+  local state=0 p name ans
+  [[ "${1:-}" == --state ]] && { state=1; shift; }
+  p="$(project_arg "${1:-}")"
+  name="$(<"$p/$STATE/container")"
+  podman rm -f "$name" >/dev/null 2>&1 || true
+  echo "removed container $name"
+  if ((state)); then
+    read -r -p "delete $p/$STATE (agent sessions, logins, history)? [y/N] " ans || ans=n
+    if [[ "$ans" == [Yy]* ]]; then rm -rf "${p:?}/$STATE"; echo "deleted $p/$STATE"; fi
+  fi
+}
+
+cmd_upgrade() {
+  local cur name img net p lock only=""
+  [[ -n "${1:-}" ]] && only="$(realpath -m "$1")"
+  cur="$(podman image inspect -f '{{.Id}}' "$ZPA_IMAGE")" || die "image $ZPA_IMAGE not found"
+  while IFS='|' read -r name img net p; do
+    [[ -n "$name" ]] || continue
+    [[ -z "$only" || "$p" == "$only" ]] || continue
+    if image_id_eq "$cur" "$img" && [[ "$net" == "$NET_SPEC" ]]; then echo "$name: current"; continue; fi
+    if [[ ! -d "$p/$STATE" ]]; then echo "$name: $p is gone, skipped (podman rm -f $name)"; continue; fi
+    exec {lock}>"$p/$STATE/lock"
+    flock "$lock"
+    podman rm -f "$name" >/dev/null
+    create "$p" "$name"
+    exec {lock}>&-
+    echo "$name: recreated"
+  done < <(podman ps -a --filter label=zpa.project --format '{{.Names}}|{{.ImageID}}|{{index .Labels "zpa.net"}}|{{index .Labels "zpa.project"}}')
+}
+
+case "$(basename "$0")" in
+  zpa-shell) cmd_shell "$@" ;;
+esac
+
+action="${1:-}"
+(($#)) && shift
+case "$action" in
+  acp)     cmd_acp "$@" ;;
+  shell)   cmd_shell "$@" ;;
+  init)    cmd_init "$@" ;;
+  status)  cmd_status "$@" ;;
+  ls)      cmd_ls ;;
+  stop)    cmd_stop "$@" ;;
+  rm)      cmd_rm "$@" ;;
+  upgrade) cmd_upgrade "$@" ;;
+  *)       sed -n '2,/^set -e/{/^#/s/^# \{0,1\}//p}' "$0"; exit 2 ;;
+esac
